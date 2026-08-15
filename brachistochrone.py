@@ -273,19 +273,26 @@ class Solution:
         """Grid column nearest to ``x_target``."""
         return int(np.argmin(np.abs(self.x - x_target)))
 
-    def path_nodes(self, ix: int, iy: int, ir: int | None = None) -> list[tuple[float, float]]:
-        """Reconstruct the minimum-time polyline to a cell, start first."""
+    def path_states(self, ix: int, iy: int, ir: int | None = None) -> list[tuple[int, int, int]]:
+        """Reconstruct the minimum-time path as ``(ix, iy, ir)`` indices, start first."""
         if ir is None:
             _, ir = self.best_at(ix, iy)
         if not math.isfinite(self.time[ix, iy, ir]):
             raise ValueError(f"state ({ix}, {iy}, {ir}) is unreachable")
-        nodes: list[tuple[float, float]] = []
+        states: list[tuple[int, int, int]] = []
         j, i, r = ix, iy, ir
         while j >= 0:
-            nodes.append((float(self.x[j]), float(self.y[i])))
+            states.append((j, i, r))
             j, i, r = (int(v) for v in self.prev[j, i, r])
-        nodes.reverse()
-        return nodes
+        states.reverse()
+        return states
+
+    def path_nodes(self, ix: int, iy: int, ir: int | None = None) -> list[tuple[float, float]]:
+        """Reconstruct the minimum-time polyline in ``(x, y)``, start first."""
+        return [
+            (float(self.x[j]), float(self.y[i]))
+            for j, i, _ in self.path_states(ix, iy, ir)
+        ]
 
     def sample_path(
         self, nodes: Sequence[tuple[float, float]], dt: float | None = None

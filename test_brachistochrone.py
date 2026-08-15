@@ -188,6 +188,32 @@ class TestSampling(unittest.TestCase):
         self.assertAlmostEqual(self.nodes[-1][0], float(self.sol.x[self.ix]))
         self.assertAlmostEqual(self.nodes[-1][1], 0.0)
 
+    def test_path_states_agree_with_path_nodes(self):
+        states = self.sol.path_states(self.ix, self.sol.shape[1] - 1)
+        self.assertEqual(len(states), len(self.nodes))
+        for (j, i, _), (x, y) in zip(states, self.nodes):
+            self.assertAlmostEqual(float(self.sol.x[j]), x)
+            self.assertAlmostEqual(float(self.sol.y[i]), y)
+
+    def test_path_states_start_at_the_origin_cell(self):
+        states = self.sol.path_states(self.ix, self.sol.shape[1] - 1)
+        self.assertEqual(states[0][:2], (0, 0))
+        self.assertEqual(states[-1][:2], (self.ix, self.sol.shape[1] - 1))
+
+    def test_path_state_headings_match_the_step_taken(self):
+        """The r index of each state is the bin of the chord that arrived there."""
+        cfg = self.sol.config
+        states = self.sol.path_states(self.ix, self.sol.shape[1] - 1)
+        for (j0, i0, _), (j1, i1, r1) in zip(states, states[1:]):
+            dx = float(self.sol.x[j1] - self.sol.x[j0])
+            dy = float(self.sol.y[i0] - self.sol.y[i1])
+            angle = math.degrees(math.atan2(dy, dx))
+            self.assertAlmostEqual(angle, float(self.sol.r_deg[r1]), delta=cfg.angle_step_deg / 2)
+
+    def test_path_states_rejects_unreachable(self):
+        with self.assertRaises(ValueError):
+            self.sol.path_states(1, 0, 0)  # horizontal first move from rest
+
     def test_samples_are_uniform_in_time_and_end_exactly(self):
         s = self.sol.sample_path(self.nodes, dt=0.1)
         self.assertAlmostEqual(s["t"][0], 0.0)
