@@ -52,6 +52,7 @@ __all__ = [
     "max_horizontal_extent",
     "analytic_brachistochrone",
     "cycloid_curve",
+    "endpoint_for_theta_ratio",
 ]
 
 
@@ -162,6 +163,30 @@ def analytic_brachistochrone(
     return time, arc
 
 
+def endpoint_for_theta_ratio(theta_over_pi: float, drop: float) -> tuple[float, float]:
+    """Endpoint offset and dip depth for a cycloid ending at ``theta = ratio*pi``.
+
+    Returns ``(x_end, dip)``, where ``dip`` is how far the curve falls *below*
+    the endpoint altitude before climbing back to it.  The lowest point of a
+    cycloid is always at ``theta = pi``, where the fall is ``2a``, so::
+
+        ratio <= 1  ->  dip = 0, the endpoint is the lowest point
+        ratio >  1  ->  dip = 2a - drop > 0
+
+    ``ratio`` must lie in ``(0, 2)``; as it approaches 2 the arch flattens and
+    ``x_end`` diverges.
+    """
+    if not 0.0 < theta_over_pi < 2.0:
+        raise ValueError("theta_over_pi must be in (0, 2)")
+    if drop <= 0:
+        raise ValueError("drop must be positive")
+    theta = theta_over_pi * math.pi
+    a = drop / (1.0 - math.cos(theta))
+    x_end = a * (theta - math.sin(theta))
+    dip = max(0.0, 2.0 * a - drop) if theta > math.pi else 0.0
+    return x_end, dip
+
+
 def cycloid_curve(
     x_end: float, drop: float, n: int = 400
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -233,6 +258,8 @@ class Config:
     y_step: float = 5.0
     x_max: float | None = None
     time_budget: float | None = None
+    theta_ratio: float | None = None
+    depth_below: float | None = None
     angle_step_deg: float = 10.0
     angle_max_deg: float = 90.0
     neighbourhood_cells: int = 5
@@ -254,6 +281,12 @@ class Config:
             raise ValueError("angle step and maximum must be positive")
         if self.neighbourhood_cells < 1:
             raise ValueError("neighbourhood_cells must be at least 1")
+        if self.theta_ratio is not None and not 0.0 < self.theta_ratio < 2.0:
+            raise ValueError("theta_ratio must be in (0, 2)")
+        if self.depth_below is not None and self.depth_below < 0:
+            raise ValueError("depth_below must be non-negative")
+        if self.theta_ratio is not None and self.x_max is not None:
+            raise TypeError("give either theta_ratio or x_max, not both")
 
     @property
     def drop(self) -> float:
@@ -262,6 +295,30 @@ class Config:
     @property
     def default_time_budget(self) -> float:
         return 2.0 * math.ceil(free_fall_time(self.drop, self.g))
+
+    @property
+    def resolved_depth(self) -> float:
+        """Grid headroom below ``y_end``, in metres.
+
+        Explicit ``depth_below`` wins.  Otherwise it is derived from
+        ``theta_ratio``: the analytic dip plus 15% slack, so the discrete path
+        is never pinned against the floor of its own search space.
+        """
+        if self.depth_below is not None:
+            return self.depth_below
+        if self.theta_ratio is None:
+            return 0.0
+        _, dip = endpoint_for_theta_ratio(self.theta_ratio, self.drop)
+        return dip * 1.15
+
+    @property
+    def allow_climb(self) -> bool:
+        """Upward chords are only meaningful once there is room below the target."""
+        return self.resolved_depth > 0.0
+
+    @property
+    def angle_min_deg(self) -> float:
+        return -self.angle_max_deg if self.allow_climb else 0.0
 
 
 # --------------------------------------------------------------------------
@@ -283,10 +340,16 @@ class Solution:
     prev: np.ndarray  # (nx, ny, nr, 3) predecessor state index, -1 at start/unreached
     x_max: float
     x_max_binding: str
+    iy_target: int  # row holding y_end; rows past it are dip headroom
 
     @property
     def shape(self) -> tuple[int, int, int]:
         return self.time.shape
+
+    @property
+    def depth_below(self) -> float:
+        """Metres of grid below the target altitude."""
+        return float(self.y[self.iy_target] - self.y[-1])
 
     def best_at(self, ix: int, iy: int) -> tuple[float, int]:
         """Fastest arrival at a cell over all headings: ``(time, ir)``."""
@@ -473,21 +536,31 @@ class Solution:
 # --------------------------------------------------------------------------
 
 
-def _primitive_moves(max_cells: int) -> Iterator[tuple[int, int]]:
-    """Forward-and-down cell offsets with no collinear duplicates."""
+def _primitive_moves(max_cells: int, allow_up: bool = False) -> Iterator[tuple[int, int]]:
+    """Forward cell offsets with no collinear duplicates.
+
+    ``di > 0`` descends, ``di < 0`` climbs.  Climbing offsets are only emitted
+    when ``allow_up`` is set; without headroom below the target they would just
+    grow the graph without ever appearing in an optimal path.
+    """
+    lo = -max_cells if allow_up else 0
     for dj in range(max_cells + 1):
-        for di in range(max_cells + 1):
+        for di in range(lo, max_cells + 1):
             if dj == 0 and di == 0:
                 continue
-            if math.gcd(dj, di) != 1:
+            if math.gcd(dj, abs(di)) != 1:
+                continue
+            # A purely vertical climb is never useful: it can only undo a fall.
+            if dj == 0 and di < 0:
                 continue
             yield dj, di
 
 
-def _bin_index(angle_deg: float, step: float, n_bins: int) -> int:
+def _bin_index(angle_deg: float, step: float, n_bins: int, angle_min: float = 0.0) -> int:
     # floor(x + 0.5) rather than round(): round() is banker's, which would send
     # a 45 deg chord to the 40 deg bin.
-    return min(max(int(math.floor(angle_deg / step + 0.5)), 0), n_bins - 1)
+    idx = int(math.floor((angle_deg - angle_min) / step + 0.5))
+    return min(max(idx, 0), n_bins - 1)
 
 
 def solve(config: Config | None = None, **overrides) -> Solution:
@@ -498,33 +571,47 @@ def solve(config: Config | None = None, **overrides) -> Solution:
 
     drop = cfg.drop
     budget = cfg.time_budget if cfg.time_budget is not None else cfg.default_time_budget
-    if cfg.x_max is not None:
+    if cfg.theta_ratio is not None:
+        # The endpoint is pinned by the cycloid parameter, so neither the
+        # geometric bound nor the time budget applies.
+        x_max, _ = endpoint_for_theta_ratio(cfg.theta_ratio, drop)
+        binding = f"theta/pi = {cfg.theta_ratio:g}"
+    elif cfg.x_max is not None:
         x_max, binding = cfg.x_max, "caller-supplied"
     else:
         x_max, binding = max_horizontal_extent(drop, cfg.g, budget)
 
-    # Snap both axes so they span their range exactly.
-    ny = max(2, int(round(drop / cfg.y_step)) + 1)
+    # Vertical axis: n_above rows spanning the drop, then n_below rows of
+    # headroom underneath so a path may dip past the target and climb back.
+    # Splitting the count this way keeps y[iy_target] exactly equal to y_end.
+    depth = cfg.resolved_depth
+    n_above = max(1, int(round(drop / cfg.y_step)))
+    n_below = int(math.ceil(depth / cfg.y_step - 1e-9)) if depth > 0 else 0
+    ny = n_above + n_below + 1
+    y_step = drop / n_above
+    y = cfg.h - np.arange(ny, dtype=float) * y_step
+    iy_target = n_above
+
     nx = max(2, int(round(x_max / cfg.x_step)) + 1)
-    y = cfg.h - np.linspace(0.0, drop, ny)
     x = np.linspace(0.0, x_max, nx)
     x_step = x_max / (nx - 1)
-    y_step = drop / (ny - 1)
 
-    nr = int(round(cfg.angle_max_deg / cfg.angle_step_deg)) + 1
-    r_deg = np.arange(nr, dtype=float) * cfg.angle_step_deg
+    nr = int(round((cfg.angle_max_deg - cfg.angle_min_deg) / cfg.angle_step_deg)) + 1
+    r_deg = cfg.angle_min_deg + np.arange(nr, dtype=float) * cfg.angle_step_deg
 
     speed = np.sqrt(cfg.v0 * cfg.v0 + 2.0 * cfg.g * (cfg.h - y))
 
     # Precompute the move set: geometry is identical at every node.
     moves = []
-    for dj, di in _primitive_moves(cfg.neighbourhood_cells):
+    for dj, di in _primitive_moves(cfg.neighbourhood_cells, cfg.allow_climb):
         seg_x, seg_y = dj * x_step, di * y_step
         length = math.hypot(seg_x, seg_y)
         angle = math.degrees(math.atan2(seg_y, seg_x))
-        if angle > cfg.angle_max_deg + 1e-9:
+        if angle > cfg.angle_max_deg + 1e-9 or angle < cfg.angle_min_deg - 1e-9:
             continue
-        moves.append((dj, di, length, _bin_index(angle, cfg.angle_step_deg, nr)))
+        moves.append(
+            (dj, di, length, _bin_index(angle, cfg.angle_step_deg, nr, cfg.angle_min_deg))
+        )
 
     shape = (nx, ny, nr)
     time = np.full(shape, np.inf)
@@ -535,7 +622,10 @@ def solve(config: Config | None = None, **overrides) -> Solution:
     if cfg.launch_angles_deg is None:
         seeds = range(nr)
     else:
-        seeds = {_bin_index(a, cfg.angle_step_deg, nr) for a in cfg.launch_angles_deg}
+        seeds = {
+            _bin_index(a, cfg.angle_step_deg, nr, cfg.angle_min_deg)
+            for a in cfg.launch_angles_deg
+        }
 
     heap: list[tuple[float, int, int, int]] = []
     for ir in seeds:
@@ -554,7 +644,7 @@ def solve(config: Config | None = None, **overrides) -> Solution:
 
         for dj, di, seg_len, ir_next in moves:
             nj, ni = j + dj, i + di
-            if nj >= nx or ni >= ny:
+            if nj >= nx or ni >= ny or ni < 0:
                 continue
             if settled[nj, ni, ir_next]:
                 continue
@@ -583,6 +673,7 @@ def solve(config: Config | None = None, **overrides) -> Solution:
         prev=prev,
         x_max=x_max,
         x_max_binding=binding,
+        iy_target=iy_target,
     )
 
 
@@ -601,6 +692,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--x-step", type=float, default=5.0, help="horizontal grid step (m)")
     p.add_argument("--y-step", type=float, default=5.0, help="vertical grid step (m)")
     p.add_argument("--x-max", type=float, default=None, help="override horizontal extent (m)")
+    p.add_argument("--theta-ratio", type=float, default=None,
+                   help="endpoint as theta/pi of the cycloid; >1 dips below the target")
+    p.add_argument("--depth-below", type=float, default=None,
+                   help="grid headroom below the target altitude (m); enables climbing")
     p.add_argument("--angle-step", type=float, default=10.0, help="heading bin width (deg)")
     p.add_argument("--neighbourhood", type=int, default=5, help="chord span in cells")
     p.add_argument("--max-turn", type=float, default=None, help="heading change limit (deg)")
@@ -620,17 +715,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         x_step=args.x_step,
         y_step=args.y_step,
         x_max=args.x_max,
+        theta_ratio=args.theta_ratio,
+        depth_below=args.depth_below,
         angle_step_deg=args.angle_step,
         neighbourhood_cells=args.neighbourhood,
         max_turn_deg=args.max_turn,
     )
     sol = solve(cfg)
     nx, ny, nr = sol.shape
+    iyt = sol.iy_target
 
     print(f"drop {cfg.drop:g} m, g {cfg.g:g} m/s^2, v0 {cfg.v0:g} m/s")
     print(f"free-fall time      {free_fall_time(cfg.drop, cfg.g, cfg.v0):.4f} s")
     print(f"time budget         {cfg.default_time_budget:g} s")
     print(f"horizontal extent   {sol.x_max:.3f} m  (limited by {sol.x_max_binding})")
+    print(f"depth below target  {sol.depth_below:.3f} m  (climbing {'on' if cfg.allow_climb else 'off'})")
     print(f"grid                {nx} x {ny} x {nr} = {nx*ny*nr} states")
     print(f"reachable           {int(np.isfinite(sol.time).sum())} states")
     print()
@@ -639,7 +738,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"{'x_end (m)':>10} {'discrete (s)':>13} {'analytic (s)':>13} {'error':>8} {'len (m)':>9}")
     for xt in targets:
         ix = sol.target_index(xt)
-        t_num, ir = sol.best_at(ix, ny - 1)
+        t_num, ir = sol.best_at(ix, iyt)
         if not math.isfinite(t_num):
             print(f"{sol.x[ix]:10.2f} {'unreachable':>13}")
             continue
@@ -647,12 +746,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         err = (t_num - t_ref) / t_ref
         print(
             f"{sol.x[ix]:10.2f} {t_num:13.4f} {t_ref:13.4f} "
-            f"{err:7.2%} {sol.length[ix, ny-1, ir]:9.2f}"
+            f"{err:7.2%} {sol.length[ix, iyt, ir]:9.2f}"
         )
 
     if args.csv is not None:
         ix = sol.target_index(args.target if args.target is not None else sol.x_max)
-        samples = sol.sample_path(sol.path_nodes(ix, ny - 1))
+        samples = sol.sample_path(sol.path_nodes(ix, iyt))
         with open(args.csv, "w", newline="") as fh:
             writer = csv.writer(fh)
             writer.writerow(samples.dtype.names)

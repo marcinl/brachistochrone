@@ -74,6 +74,7 @@ def plot(
     from matplotlib.widgets import Slider
 
     nx, ny, nr = sol.shape
+    iyt = sol.iy_target
     cfg_y_end = sol.config.y_end
     cmap = make_colormap()
 
@@ -109,11 +110,11 @@ def plot(
     if target_x is None:
         target_x = float(sol.x[-1])
     jt = sol.target_index(target_x)
-    t_best, ir_best = sol.best_at(jt, ny - 1)
+    t_best, ir_best = sol.best_at(jt, iyt)
     if not math.isfinite(t_best):
         raise SystemExit(f"no path reaches x = {sol.x[jt]:.2f} m")
 
-    states = sol.path_states(jt, ny - 1, ir_best)
+    states = sol.path_states(jt, iyt, ir_best)
     lx = np.array([sol.x[j] for j, _, _ in states])
     ly = np.array([sol.r_deg[r] for _, _, r in states])
     lz = np.array([sol.y[i] for _, i, _ in states])
@@ -172,7 +173,7 @@ def plot(
     ax.plot(
         [x0, x1, x1, x0, x0],
         [r0, r0, r1, r1, r0],
-        [float(sol.y[-1])] * 5,
+        [float(sol.y[iyt])] * 5,
         color="0.45",
         linewidth=1.0,
         linestyle="--",
@@ -194,7 +195,7 @@ def plot(
     ax.set_title(
         f"Brachistochrone state space  —  {int(np.isfinite(sol.length).sum())} reachable states\n"
         f"optimal path to x = {sol.x[jt]:.1f} m:  t = {t_best:.4f} s,  "
-        f"length = {sol.length[jt, ny - 1, ir_best]:.1f} m",
+        f"length = {sol.length[jt, iyt, ir_best]:.1f} m",
         fontsize=11,
         pad=4,
     )
@@ -231,15 +232,15 @@ def plot_curve(sol, target_x: float | None = None, show_samples: bool = True):
     from brachistochrone import analytic_brachistochrone, cycloid_curve
 
     cfg = sol.config
-    ny = sol.shape[1]
+    iyt = sol.iy_target
     if target_x is None:
         target_x = float(sol.x[-1])
     jt = sol.target_index(target_x)
-    t_total, ir = sol.best_at(jt, ny - 1)
+    t_total, ir = sol.best_at(jt, iyt)
     if not math.isfinite(t_total):
         raise SystemExit(f"no path reaches x = {sol.x[jt]:.2f} m")
 
-    seg = sol.path_segments(jt, ny - 1, ir)
+    seg = sol.path_segments(jt, iyt, ir)
     x_end = float(sol.x[jt])
 
     fig, (ax, ax2) = plt.subplots(
@@ -273,7 +274,7 @@ def plot_curve(sol, target_x: float | None = None, show_samples: bool = True):
 
     # --- ball positions every dt --------------------------------------------
     if show_samples:
-        s = sol.sample_path(sol.path_nodes(jt, ny - 1, ir))
+        s = sol.sample_path(sol.path_nodes(jt, iyt, ir))
         ax.plot(s["x"], s["y"], linestyle="none", marker=".", markersize=7,
                 color="black", alpha=0.55, zorder=5,
                 label=f"ball every dt = {cfg.dt:g} s  ({len(s)} samples)")
@@ -314,6 +315,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--x-step", type=float, default=5.0, help="horizontal grid step (m)")
     p.add_argument("--y-step", type=float, default=5.0, help="vertical grid step (m)")
     p.add_argument("--x-max", type=float, default=None, help="override horizontal extent (m)")
+    p.add_argument("--theta-ratio", type=float, default=None,
+                   help="endpoint as theta/pi of the cycloid; >1 dips below the target")
+    p.add_argument("--depth-below", type=float, default=None,
+                   help="grid headroom below the target altitude (m); enables climbing")
     p.add_argument("--neighbourhood", type=int, default=5, help="chord span in cells")
     p.add_argument("--max-turn", type=float, default=None, help="heading change limit (deg)")
     p.add_argument("--target", type=float, default=None, help="endpoint for the overlaid path (m)")
@@ -350,6 +355,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             x_step=args.x_step,
             y_step=args.y_step,
             x_max=args.x_max,
+            theta_ratio=args.theta_ratio,
+            depth_below=args.depth_below,
             neighbourhood_cells=args.neighbourhood,
             max_turn_deg=args.max_turn,
         )

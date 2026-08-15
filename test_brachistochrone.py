@@ -12,8 +12,10 @@ import numpy as np
 
 from brachistochrone import (
     Config,
+    _primitive_moves,
     analytic_brachistochrone,
     cycloid_curve,
+    endpoint_for_theta_ratio,
     free_fall_time,
     max_horizontal_extent,
     solve,
@@ -295,6 +297,127 @@ class TestCycloidCurve(unittest.TestCase):
         x, drop = cycloid_curve(0.0, 100.0, n=50)
         np.testing.assert_allclose(x, 0.0)
         self.assertAlmostEqual(drop[-1], 100.0)
+
+
+class TestThetaRatio(unittest.TestCase):
+    """Endpoints past theta = pi must dip below the target and climb back."""
+
+    def test_ratio_one_is_the_threshold(self):
+        x_end, dip = endpoint_for_theta_ratio(1.0, 100.0)
+        self.assertAlmostEqual(x_end, math.pi * 50.0, places=9)
+        self.assertEqual(dip, 0.0)
+
+    def test_dip_grows_past_the_threshold(self):
+        dips = [endpoint_for_theta_ratio(r, 100.0)[1] for r in (1.05, 1.117, 1.216, 1.29)]
+        self.assertTrue(all(d > 0 for d in dips))
+        self.assertTrue(all(b > a for a, b in zip(dips, dips[1:])))
+
+    def test_no_dip_below_the_threshold(self):
+        for r in (0.3, 0.521, 0.862, 0.999):
+            self.assertEqual(endpoint_for_theta_ratio(r, 100.0)[1], 0.0)
+
+    def test_matches_the_plotted_endpoints(self):
+        """The four curves from the comparison figure."""
+        for ratio, expected in ((1.0, 157.08), (1.117, 200.11), (1.216, 250.10), (1.29, 300.25)):
+            self.assertAlmostEqual(endpoint_for_theta_ratio(ratio, 100.0)[0], expected, places=1)
+
+    def test_rejects_out_of_range(self):
+        for bad in (0.0, -0.5, 2.0, 2.5):
+            with self.assertRaises(ValueError):
+                endpoint_for_theta_ratio(bad, 100.0)
+        with self.assertRaises(ValueError):
+            Config(theta_ratio=2.5)
+
+    def test_rejects_theta_ratio_with_x_max(self):
+        with self.assertRaises(TypeError):
+            Config(theta_ratio=1.2, x_max=200.0)
+
+
+class TestClimbing(unittest.TestCase):
+    def setUp(self):
+        self.sol = solve(Config(theta_ratio=1.29, x_step=5.0, y_step=5.0))
+        self.seg = self.sol.path_segments(self.sol.shape[0] - 1, self.sol.iy_target)
+
+    def test_target_row_is_not_the_last_row(self):
+        self.assertLess(self.sol.iy_target, self.sol.shape[1] - 1)
+        self.assertAlmostEqual(float(self.sol.y[self.sol.iy_target]), 0.0, places=9)
+
+    def test_grid_has_headroom_below_the_target(self):
+        self.assertGreater(self.sol.depth_below, 0.0)
+        self.assertLess(float(self.sol.y[-1]), 0.0)
+
+    def test_path_dips_below_the_target(self):
+        lowest = min(self.seg["y1"].min(), self.seg["y2"].min())
+        self.assertLess(lowest, -1e-9)
+
+    def test_path_climbs_back_to_the_target(self):
+        self.assertGreater(int((self.seg["dy"] > 1e-9).sum()), 0)
+        self.assertAlmostEqual(float(self.seg["y2"][-1]), 0.0, places=9)
+
+    def test_lowest_point_precedes_the_endpoint(self):
+        """The question that motivated this: the minimum is not at the end."""
+        i_low = int(np.argmin(self.seg["y1"]))
+        self.assertLess(self.seg["x1"][i_low], self.seg["x2"][-1])
+
+    def test_climbing_segments_have_negative_angles(self):
+        climbs = self.seg[self.seg["dy"] > 1e-9]
+        self.assertTrue(np.all(climbs["angle_deg"] < 0.0))
+
+    def test_heading_axis_extends_negative(self):
+        self.assertLess(float(self.sol.r_deg[0]), 0.0)
+        self.assertAlmostEqual(float(self.sol.r_deg[0]), -90.0)
+        self.assertAlmostEqual(float(self.sol.r_deg[-1]), 90.0)
+
+    def test_speeds_still_follow_energy_conservation_below_zero(self):
+        np.testing.assert_allclose(
+            self.seg["v1"], np.sqrt(2 * 9.81 * (100.0 - self.seg["y1"])), atol=1e-9
+        )
+
+    def test_beats_the_monotone_solution(self):
+        """Dipping must pay, or the extra states were pointless."""
+        x_end, _ = endpoint_for_theta_ratio(1.29, 100.0)
+        flat = solve(Config(x_max=x_end, x_step=5.0, y_step=5.0))
+        t_flat, _ = flat.best_at(flat.shape[0] - 1, flat.iy_target)
+        t_dip, _ = self.sol.best_at(self.sol.shape[0] - 1, self.sol.iy_target)
+        self.assertLess(t_dip, t_flat)
+
+    def test_refining_tightens_the_bound(self):
+        from brachistochrone import analytic_brachistochrone
+
+        x_end, _ = endpoint_for_theta_ratio(1.29, 100.0)
+        t_ref, _ = analytic_brachistochrone(x_end, 100.0, 9.81)
+
+        def err(step, nb):
+            s = solve(Config(theta_ratio=1.29, x_step=step, y_step=step, neighbourhood_cells=nb))
+            t, _ = s.best_at(s.shape[0] - 1, s.iy_target)
+            return (t - t_ref) / t_ref
+
+        self.assertLess(err(2.5, 6), err(5.0, 5))
+        self.assertGreater(err(5.0, 5), 0.0)  # still an upper bound
+
+
+class TestDefaultsUnchanged(unittest.TestCase):
+    """The climbing machinery must stay dormant unless asked for."""
+
+    def setUp(self):
+        self.sol = solve(Config())
+
+    def test_no_headroom_by_default(self):
+        self.assertEqual(self.sol.depth_below, 0.0)
+        self.assertEqual(self.sol.iy_target, self.sol.shape[1] - 1)
+
+    def test_heading_axis_stays_non_negative(self):
+        self.assertEqual(self.sol.shape[2], 10)
+        self.assertAlmostEqual(float(self.sol.r_deg[0]), 0.0)
+
+    def test_no_upward_moves_generated(self):
+        self.assertEqual(sum(1 for _, di in _primitive_moves(5, allow_up=False) if di < 0), 0)
+        self.assertGreater(sum(1 for _, di in _primitive_moves(5, allow_up=True) if di < 0), 0)
+
+    def test_vertical_climbs_are_never_emitted(self):
+        self.assertEqual(
+            sum(1 for dj, di in _primitive_moves(5, allow_up=True) if dj == 0 and di < 0), 0
+        )
 
 
 class TestConfigValidation(unittest.TestCase):
