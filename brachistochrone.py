@@ -51,6 +51,7 @@ __all__ = [
     "free_fall_time",
     "max_horizontal_extent",
     "analytic_brachistochrone",
+    "cycloid_curve",
 ]
 
 
@@ -120,6 +121,25 @@ def max_horizontal_extent(
     return a * (theta - math.sin(theta)), binding
 
 
+def _cycloid_params(x_end: float, drop: float) -> tuple[float, float]:
+    """Radius ``a`` and final parameter ``theta`` of the cycloid through the endpoint.
+
+    Solves ``(theta - sin theta) / (1 - cos theta) = x_end / drop`` by bisection;
+    the ratio is monotonic on ``(0, 2pi)``, so the bracket is safe.
+    """
+    target = x_end / drop
+    lo, hi = 1e-9, 2.0 * math.pi - 1e-9
+    for _ in range(300):
+        mid = 0.5 * (lo + hi)
+        ratio = (mid - math.sin(mid)) / (1.0 - math.cos(mid))
+        if ratio < target:
+            lo = mid
+        else:
+            hi = mid
+    theta = 0.5 * (lo + hi)
+    return drop / (1.0 - math.cos(theta)), theta
+
+
 def analytic_brachistochrone(
     x_end: float, drop: float, g: float = 9.81
 ) -> tuple[float, float]:
@@ -135,22 +155,27 @@ def analytic_brachistochrone(
     if x_end == 0:
         return free_fall_time(drop, g), drop
 
-    # Solve (theta - sin theta) / (1 - cos theta) = x_end / drop for theta in (0, 2pi).
-    target = x_end / drop
-    lo, hi = 1e-9, 2.0 * math.pi - 1e-9
-    for _ in range(300):
-        mid = 0.5 * (lo + hi)
-        ratio = (mid - math.sin(mid)) / (1.0 - math.cos(mid))
-        if ratio < target:
-            lo = mid
-        else:
-            hi = mid
-    theta = 0.5 * (lo + hi)
-    a = drop / (1.0 - math.cos(theta))
+    a, theta = _cycloid_params(x_end, drop)
     time = math.sqrt(a / g) * theta
     # Cycloid arc length: integral of a*sqrt(2(1-cos t)) dt = 4a(1 - cos(theta/2)).
     arc = 4.0 * a * (1.0 - math.cos(0.5 * theta))
     return time, arc
+
+
+def cycloid_curve(
+    x_end: float, drop: float, n: int = 400
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample the continuous brachistochrone for overlay plotting.
+
+    Returns ``(x, y_drop)`` where ``y_drop`` is metres fallen below the start.
+    """
+    if drop <= 0:
+        raise ValueError("drop must be positive")
+    if x_end <= 0:
+        return np.zeros(n), np.linspace(0.0, drop, n)
+    a, theta = _cycloid_params(x_end, drop)
+    t = np.linspace(0.0, theta, n)
+    return a * (t - np.sin(t)), a * (1.0 - np.cos(t))
 
 
 # --------------------------------------------------------------------------
@@ -293,6 +318,50 @@ class Solution:
             (float(self.x[j]), float(self.y[i]))
             for j, i, _ in self.path_states(ix, iy, ir)
         ]
+
+    def path_segments(
+        self, ix: int, iy: int, ir: int | None = None
+    ) -> np.ndarray:
+        """Per-chord breakdown of the minimum-time path.
+
+        Returns a structured array with one row per segment: the endpoints
+        ``x1, y1, x2, y2``, the step ``dx, dy``, chord ``length``, entry and exit
+        speeds ``v1, v2``, the chord's ``angle_deg`` below horizontal, its
+        duration ``dt_seg``, and the running ``t_start, t_end, s_end``.
+
+        These are exactly the edges Dijkstra relaxed, so summing ``dt_seg``
+        reproduces the reported minimum time to machine precision.
+        """
+        nodes = self.path_nodes(ix, iy, ir)
+        if len(nodes) < 2:
+            raise ValueError("path has no segments")
+        dtype = np.dtype(
+            [
+                ("x1", "f8"), ("y1", "f8"), ("x2", "f8"), ("y2", "f8"),
+                ("dx", "f8"), ("dy", "f8"), ("length", "f8"),
+                ("v1", "f8"), ("v2", "f8"), ("angle_deg", "f8"),
+                ("dt_seg", "f8"), ("t_start", "f8"), ("t_end", "f8"), ("s_end", "f8"),
+            ]
+        )
+        out = np.empty(len(nodes) - 1, dtype=dtype)
+        t_cursor = 0.0
+        s_cursor = 0.0
+        for k, ((x1, y1), (x2, y2)) in enumerate(zip(nodes, nodes[1:])):
+            dx, dy = x2 - x1, y2 - y1
+            length = math.hypot(dx, dy)
+            v1 = self._speed_at_altitude(y1)
+            v2 = self._speed_at_altitude(y2)
+            if v1 + v2 <= 0.0:
+                raise ValueError("segment is untraversable from rest")
+            dt_seg = 2.0 * length / (v1 + v2)
+            s_cursor += length
+            out[k] = (
+                x1, y1, x2, y2, dx, dy, length, v1, v2,
+                math.degrees(math.atan2(-dy, dx)),
+                dt_seg, t_cursor, t_cursor + dt_seg, s_cursor,
+            )
+            t_cursor += dt_seg
+        return out
 
     def sample_path(
         self, nodes: Sequence[tuple[float, float]], dt: float | None = None

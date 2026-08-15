@@ -13,6 +13,7 @@ import numpy as np
 from brachistochrone import (
     Config,
     analytic_brachistochrone,
+    cycloid_curve,
     free_fall_time,
     max_horizontal_extent,
     solve,
@@ -231,6 +232,69 @@ class TestSampling(unittest.TestCase):
     def test_final_speed_is_the_free_fall_speed(self):
         s = self.sol.sample_path(self.nodes)
         self.assertAlmostEqual(s["v"][-1], math.sqrt(2 * 9.81 * 100.0), places=6)
+
+
+class TestSegments(unittest.TestCase):
+    """The per-chord breakdown must reconstruct the DP result exactly."""
+
+    def setUp(self):
+        self.sol = solve(Config(h=100.0, x_step=5.0, y_step=5.0))
+        self.ny = self.sol.shape[1]
+        self.ix = self.sol.shape[0] - 1
+        self.seg = self.sol.path_segments(self.ix, self.ny - 1)
+
+    def test_durations_sum_to_the_reported_minimum(self):
+        t_total, _ = self.sol.best_at(self.ix, self.ny - 1)
+        self.assertAlmostEqual(self.seg["dt_seg"].sum(), t_total, places=9)
+
+    def test_lengths_sum_to_the_reported_path_length(self):
+        _, ir = self.sol.best_at(self.ix, self.ny - 1)
+        self.assertAlmostEqual(
+            self.seg["length"].sum(), self.sol.length[self.ix, self.ny - 1, ir], places=9
+        )
+
+    def test_segments_are_contiguous(self):
+        np.testing.assert_allclose(self.seg["x2"][:-1], self.seg["x1"][1:])
+        np.testing.assert_allclose(self.seg["y2"][:-1], self.seg["y1"][1:])
+
+    def test_running_totals_are_consistent(self):
+        np.testing.assert_allclose(
+            self.seg["t_end"] - self.seg["t_start"], self.seg["dt_seg"], atol=1e-12
+        )
+        np.testing.assert_allclose(self.seg["s_end"], np.cumsum(self.seg["length"]))
+
+    def test_exit_speed_matches_next_entry_speed(self):
+        np.testing.assert_allclose(self.seg["v2"][:-1], self.seg["v1"][1:], atol=1e-12)
+
+    def test_speeds_follow_energy_conservation(self):
+        np.testing.assert_allclose(
+            self.seg["v1"], np.sqrt(2 * 9.81 * (100.0 - self.seg["y1"])), atol=1e-9
+        )
+
+    def test_chord_angles_shallow_out(self):
+        """A cycloid from rest starts vertical and flattens; never the reverse."""
+        self.assertGreater(self.seg["angle_deg"][0], 80.0)
+        self.assertLess(self.seg["angle_deg"][-1], 10.0)
+        self.assertTrue(np.all(np.diff(self.seg["angle_deg"]) <= 1e-9))
+
+
+class TestCycloidCurve(unittest.TestCase):
+    def test_endpoints(self):
+        x, drop = cycloid_curve(157.08, 100.0, n=200)
+        self.assertAlmostEqual(x[0], 0.0, places=9)
+        self.assertAlmostEqual(drop[0], 0.0, places=9)
+        self.assertAlmostEqual(x[-1], 157.08, places=6)
+        self.assertAlmostEqual(drop[-1], 100.0, places=6)
+
+    def test_monotone_within_the_half_arch(self):
+        x, drop = cycloid_curve(math.pi * 50.0, 100.0, n=200)
+        self.assertTrue(np.all(np.diff(x) >= -1e-12))
+        self.assertTrue(np.all(np.diff(drop) >= -1e-12))
+
+    def test_degenerate_vertical_case(self):
+        x, drop = cycloid_curve(0.0, 100.0, n=50)
+        np.testing.assert_allclose(x, 0.0)
+        self.assertAlmostEqual(drop[-1], 100.0)
 
 
 class TestConfigValidation(unittest.TestCase):

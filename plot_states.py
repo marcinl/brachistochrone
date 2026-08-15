@@ -66,6 +66,7 @@ def plot(
     elev: float = 22.0,
     azim: float = -58.0,
     roll: float = 0.0,
+    margin: float = 0.05,
     interactive: bool = True,
 ):
     """Render the state space.  Returns ``(fig, ax)``."""
@@ -73,6 +74,7 @@ def plot(
     from matplotlib.widgets import Slider
 
     nx, ny, nr = sol.shape
+    cfg_y_end = sol.config.y_end
     cmap = make_colormap()
 
     # --- point cloud -----------------------------------------------------
@@ -153,9 +155,31 @@ def plot(
     ax.set_xlabel("x  —  horizontal position (m)", labelpad=12)
     ax.set_ylabel("r  —  heading below horizontal (deg)", labelpad=12)
     ax.set_zlabel("y  —  altitude (m)", labelpad=10)
-    ax.set_xlim(0.0, float(sol.x[-1]))
-    ax.set_ylim(float(sol.r_deg[0]), float(sol.r_deg[-1]))
-    ax.set_zlim(float(sol.y[-1]), float(sol.y[0]))
+    # Pad every axis past the data range.  The optimal path runs exactly along
+    # y = y_end, x = x_max and r = 0, so limits set to the bare data range clip
+    # those runs to half a line width and they read as missing.
+    def _padded(lo: float, hi: float) -> tuple[float, float]:
+        pad = margin * (hi - lo)
+        return lo - pad, hi + pad
+
+    ax.set_xlim(*_padded(0.0, float(sol.x[-1])))
+    ax.set_ylim(*_padded(float(sol.r_deg[0]), float(sol.r_deg[-1])))
+    ax.set_zlim(*_padded(float(sol.y[-1]), float(sol.y[0])))
+
+    # With headroom below the floor, mark where the target altitude actually is.
+    x0, x1 = 0.0, float(sol.x[-1])
+    r0, r1 = float(sol.r_deg[0]), float(sol.r_deg[-1])
+    ax.plot(
+        [x0, x1, x1, x0, x0],
+        [r0, r0, r1, r1, r0],
+        [float(sol.y[-1])] * 5,
+        color="0.45",
+        linewidth=1.0,
+        linestyle="--",
+        alpha=0.8,
+        zorder=3,
+        label=f"target altitude ({cfg_y_end:g} m)",
+    )
     ax.set_box_aspect((1.6, 1.0, 1.1))
     for pane in (ax.xaxis, ax.yaxis, ax.zaxis):
         pane.pane.set_facecolor("#ececef")  # light: near-black points must read
@@ -170,7 +194,7 @@ def plot(
     ax.set_title(
         f"Brachistochrone state space  —  {int(np.isfinite(sol.length).sum())} reachable states\n"
         f"optimal path to x = {sol.x[jt]:.1f} m:  t = {t_best:.4f} s,  "
-        f"length = {sol.length[jt, ny-1, ir_best]:.1f} m",
+        f"length = {sol.length[jt, ny - 1, ir_best]:.1f} m",
         fontsize=11,
         pad=4,
     )
@@ -193,6 +217,94 @@ def plot(
     return fig, ax
 
 
+def plot_curve(sol, target_x: float | None = None, show_samples: bool = True):
+    """Plot the descent curve assembled from its individual chord segments.
+
+    Upper panel: the physical ``(x, altitude)`` track.  Each chord is drawn as
+    its own coloured segment so the piecewise construction is visible, with the
+    continuous cycloid overlaid for reference.  Lower panel: speed against time,
+    which must lie exactly on ``sqrt(2*g*(h-y))`` whatever the route.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+
+    from brachistochrone import analytic_brachistochrone, cycloid_curve
+
+    cfg = sol.config
+    ny = sol.shape[1]
+    if target_x is None:
+        target_x = float(sol.x[-1])
+    jt = sol.target_index(target_x)
+    t_total, ir = sol.best_at(jt, ny - 1)
+    if not math.isfinite(t_total):
+        raise SystemExit(f"no path reaches x = {sol.x[jt]:.2f} m")
+
+    seg = sol.path_segments(jt, ny - 1, ir)
+    x_end = float(sol.x[jt])
+
+    fig, (ax, ax2) = plt.subplots(
+        2, 1, figsize=(11.0, 9.0), height_ratios=(2.4, 1.0), constrained_layout=True
+    )
+
+    # --- chord segments, coloured by the speed they are traversed at ---------
+    pts = np.column_stack([seg["x1"], seg["y1"]])
+    pts = np.vstack([pts, [[seg["x2"][-1], seg["y2"][-1]]]])
+    lines = np.stack([pts[:-1], pts[1:]], axis=1)
+    lc = LineCollection(lines, cmap=make_colormap(), linewidths=4.0, zorder=3)
+    lc.set_array(0.5 * (seg["v1"] + seg["v2"]))
+    ax.add_collection(lc)
+    cbar = fig.colorbar(lc, ax=ax, pad=0.02)
+    cbar.set_label("segment speed (m/s)")
+
+    # Chord joints: these are the grid nodes Dijkstra actually settled on.
+    ax.plot(
+        pts[:, 0], pts[:, 1], linestyle="none", marker="o", markersize=5,
+        markerfacecolor="white", markeredgecolor="black", markeredgewidth=1.0,
+        zorder=4, label=f"chord joints ({len(seg)} segments)",
+    )
+
+    # --- continuous reference ------------------------------------------------
+    cx, cdrop = cycloid_curve(x_end, cfg.drop)
+    t_ref, arc_ref = analytic_brachistochrone(x_end, cfg.drop, cfg.g)
+    ax.plot(cx, cfg.h - cdrop, color="0.35", linewidth=1.6, linestyle="--",
+            zorder=2, label=f"continuous cycloid  ({t_ref:.4f} s)")
+    ax.plot([0.0, x_end], [cfg.h, cfg.y_end], color="0.6", linewidth=1.2,
+            linestyle=":", zorder=1, label="straight chord (slower)")
+
+    # --- ball positions every dt --------------------------------------------
+    if show_samples:
+        s = sol.sample_path(sol.path_nodes(jt, ny - 1, ir))
+        ax.plot(s["x"], s["y"], linestyle="none", marker=".", markersize=7,
+                color="black", alpha=0.55, zorder=5,
+                label=f"ball every dt = {cfg.dt:g} s  ({len(s)} samples)")
+
+    ax.set_xlabel("x  —  horizontal position (m)")
+    ax.set_ylabel("altitude (m)")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, color="0.9")
+    ax.set_title(
+        f"Minimum-time descent  (0, {cfg.h:g})  ->  ({x_end:.2f}, {cfg.y_end:g})\n"
+        f"discrete {t_total:.4f} s over {seg['length'].sum():.2f} m   |   "
+        f"cycloid {t_ref:.4f} s over {arc_ref:.2f} m   |   "
+        f"gap {(t_total - t_ref) / t_ref:+.2%}",
+        fontsize=11,
+    )
+    ax.legend(loc="lower left", fontsize=9, framealpha=0.9)
+
+    # --- speed profile -------------------------------------------------------
+    t_nodes = np.concatenate([seg["t_start"], [seg["t_end"][-1]]])
+    v_nodes = np.concatenate([seg["v1"], [seg["v2"][-1]]])
+    ax2.plot(t_nodes, v_nodes, color="#1f77b4", linewidth=2.0, label="speed at chord joints")
+    ax2.axhline(math.sqrt(cfg.v0**2 + 2 * cfg.g * cfg.drop), color="0.5",
+                linestyle="--", linewidth=1.2, label="sqrt(v0² + 2g·drop)")
+    ax2.set_xlabel("t (s)")
+    ax2.set_ylabel("speed (m/s)")
+    ax2.grid(True, color="0.9")
+    ax2.legend(loc="lower right", fontsize=9)
+
+    return fig, (ax, ax2)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--height", type=float, default=100.0, help="start altitude (m)")
@@ -211,6 +323,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--elev", type=float, default=22.0, help="initial elevation (deg)")
     p.add_argument("--azim", type=float, default=-58.0, help="initial azimuth (deg)")
     p.add_argument("--roll", type=float, default=0.0, help="initial roll (deg)")
+    p.add_argument("--curve", action="store_true",
+                   help="plot the descent curve from its chord segments instead of the state space")
+    p.add_argument("--segments-csv", type=str, default=None,
+                   help="write the per-segment breakdown here")
     p.add_argument("--save", type=str, default=None, help="write the figure here instead of showing")
     p.add_argument("--dpi", type=int, default=140, help="resolution for --save")
     return p
@@ -238,17 +354,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_turn_deg=args.max_turn,
         )
     )
-    fig, _ = plot(
-        sol,
-        target_x=args.target,
-        stride=args.stride,
-        point_size=args.point_size,
-        alpha=args.alpha,
-        elev=args.elev,
-        azim=args.azim,
-        roll=args.roll,
-        interactive=args.save is None,
-    )
+    if args.segments_csv is not None:
+        import csv
+
+        jt = sol.target_index(args.target if args.target is not None else sol.x_max)
+        seg = sol.path_segments(jt, sol.shape[1] - 1)
+        with open(args.segments_csv, "w", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(seg.dtype.names)
+            for row in seg:
+                writer.writerow([f"{v:.6f}" for v in row])
+        print(f"wrote {len(seg)} segments to {args.segments_csv}")
+
+    if args.curve:
+        fig, _ = plot_curve(sol, target_x=args.target)
+    else:
+        fig, _ = plot(
+            sol,
+            target_x=args.target,
+            stride=args.stride,
+            point_size=args.point_size,
+            alpha=args.alpha,
+            elev=args.elev,
+            azim=args.azim,
+            roll=args.roll,
+            interactive=args.save is None,
+        )
 
     if args.save is not None:
         fig.savefig(args.save, dpi=args.dpi, bbox_inches="tight")
