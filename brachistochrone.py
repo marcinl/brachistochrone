@@ -682,22 +682,55 @@ def solve(config: Config | None = None, **overrides) -> Solution:
 # --------------------------------------------------------------------------
 
 
+def _positive_float(text: str) -> float:
+    """argparse type: a strictly positive real number."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number")
+    if not value > 0:
+        raise argparse.ArgumentTypeError(f"must be positive, got {value:g}")
+    return value
+
+
+def _non_negative_float(text: str) -> float:
+    """argparse type: a real number at or above zero."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number")
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be non-negative, got {value:g}")
+    return value
+
+
+def _positive_int(text: str) -> int:
+    """argparse type: a whole number of at least one."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number")
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
+    return value
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--height", type=float, default=100.0, help="start altitude (m)")
+    p.add_argument("--height", type=_positive_float, default=100.0, help="start altitude (m)")
     p.add_argument("--end-altitude", type=float, default=0.0, help="end altitude (m)")
-    p.add_argument("--gravity", type=float, default=9.81, help="g (m/s^2)")
-    p.add_argument("--dt", type=float, default=0.1, help="output sampling interval (s)")
-    p.add_argument("--v0", type=float, default=0.0, help="initial speed (m/s)")
-    p.add_argument("--x-step", type=float, default=5.0, help="horizontal grid step (m)")
-    p.add_argument("--y-step", type=float, default=5.0, help="vertical grid step (m)")
-    p.add_argument("--x-max", type=float, default=None, help="override horizontal extent (m)")
-    p.add_argument("--theta-ratio", type=float, default=None,
+    p.add_argument("--gravity", type=_positive_float, default=9.81, help="g (m/s^2)")
+    p.add_argument("--dt", type=_positive_float, default=0.1, help="output sampling interval (s)")
+    p.add_argument("--v0", type=_non_negative_float, default=0.0, help="initial speed (m/s)")
+    p.add_argument("--x-step", type=_positive_float, default=5.0, help="horizontal grid step (m)")
+    p.add_argument("--y-step", type=_positive_float, default=5.0, help="vertical grid step (m)")
+    p.add_argument("--x-max", type=_positive_float, default=None, help="override horizontal extent (m)")
+    p.add_argument("--theta-ratio", type=_positive_float, default=None,
                    help="endpoint as theta/pi of the cycloid; >1 dips below the target")
-    p.add_argument("--depth-below", type=float, default=None,
+    p.add_argument("--depth-below", type=_non_negative_float, default=None,
                    help="grid headroom below the target altitude (m); enables climbing")
-    p.add_argument("--angle-step", type=float, default=10.0, help="heading bin width (deg)")
-    p.add_argument("--neighbourhood", type=int, default=5, help="chord span in cells")
+    p.add_argument("--angle-step", type=_positive_float, default=10.0, help="heading bin width (deg)")
+    p.add_argument("--neighbourhood", type=_positive_int, default=5, help="chord span in cells")
     p.add_argument("--max-turn", type=float, default=None, help="heading change limit (deg)")
     p.add_argument("--target", type=float, default=None, help="endpoint offset to report (m)")
     p.add_argument("--csv", type=str, default=None, help="write the sampled path here")
@@ -705,23 +738,30 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
-    cfg = Config(
-        h=args.height,
-        y_end=args.end_altitude,
-        g=args.gravity,
-        dt=args.dt,
-        v0=args.v0,
-        x_step=args.x_step,
-        y_step=args.y_step,
-        x_max=args.x_max,
-        theta_ratio=args.theta_ratio,
-        depth_below=args.depth_below,
-        angle_step_deg=args.angle_step,
-        neighbourhood_cells=args.neighbourhood,
-        max_turn_deg=args.max_turn,
-    )
-    sol = solve(cfg)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    try:
+        cfg = Config(
+            h=args.height,
+            y_end=args.end_altitude,
+            g=args.gravity,
+            dt=args.dt,
+            v0=args.v0,
+            x_step=args.x_step,
+            y_step=args.y_step,
+            x_max=args.x_max,
+            theta_ratio=args.theta_ratio,
+            depth_below=args.depth_below,
+            angle_step_deg=args.angle_step,
+            neighbourhood_cells=args.neighbourhood,
+            max_turn_deg=args.max_turn,
+        )
+        sol = solve(cfg)
+    except (ValueError, TypeError) as exc:
+        # Cross-field problems (h below y_end, theta_ratio with x_max) can only
+        # be caught once the values are combined, so report them the same way
+        # argparse reports a bad single value: usage line, message, exit 2.
+        parser.error(str(exc))
     nx, ny, nr = sol.shape
     iyt = sol.iy_target
 

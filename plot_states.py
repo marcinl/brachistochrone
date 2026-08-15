@@ -33,7 +33,13 @@ from typing import Sequence
 
 import numpy as np
 
-from brachistochrone import Config, solve
+from brachistochrone import (
+    Config,
+    _non_negative_float,
+    _positive_float,
+    _positive_int,
+    solve,
+)
 
 # Anchor stops requested for the colour ramp.  The two unnamed intermediates
 # (deep blue, orange) only keep saturation up: interpolating navy straight to
@@ -308,21 +314,21 @@ def plot_curve(sol, target_x: float | None = None, show_samples: bool = True):
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--height", type=float, default=100.0, help="start altitude (m)")
+    p.add_argument("--height", type=_positive_float, default=100.0, help="start altitude (m)")
     p.add_argument("--end-altitude", type=float, default=0.0, help="end altitude (m)")
-    p.add_argument("--gravity", type=float, default=9.81, help="g (m/s^2)")
-    p.add_argument("--v0", type=float, default=0.0, help="initial speed (m/s)")
-    p.add_argument("--x-step", type=float, default=5.0, help="horizontal grid step (m)")
-    p.add_argument("--y-step", type=float, default=5.0, help="vertical grid step (m)")
-    p.add_argument("--x-max", type=float, default=None, help="override horizontal extent (m)")
-    p.add_argument("--theta-ratio", type=float, default=None,
+    p.add_argument("--gravity", type=_positive_float, default=9.81, help="g (m/s^2)")
+    p.add_argument("--v0", type=_non_negative_float, default=0.0, help="initial speed (m/s)")
+    p.add_argument("--x-step", type=_positive_float, default=5.0, help="horizontal grid step (m)")
+    p.add_argument("--y-step", type=_positive_float, default=5.0, help="vertical grid step (m)")
+    p.add_argument("--x-max", type=_positive_float, default=None, help="override horizontal extent (m)")
+    p.add_argument("--theta-ratio", type=_positive_float, default=None,
                    help="endpoint as theta/pi of the cycloid; >1 dips below the target")
-    p.add_argument("--depth-below", type=float, default=None,
+    p.add_argument("--depth-below", type=_non_negative_float, default=None,
                    help="grid headroom below the target altitude (m); enables climbing")
-    p.add_argument("--neighbourhood", type=int, default=5, help="chord span in cells")
+    p.add_argument("--neighbourhood", type=_positive_int, default=5, help="chord span in cells")
     p.add_argument("--max-turn", type=float, default=None, help="heading change limit (deg)")
     p.add_argument("--target", type=float, default=None, help="endpoint for the overlaid path (m)")
-    p.add_argument("--stride", type=int, default=1, help="thin the cloud by this factor")
+    p.add_argument("--stride", type=_positive_int, default=1, help="thin the cloud by this factor")
     p.add_argument("--point-size", type=float, default=9.0, help="scatter marker size")
     p.add_argument("--alpha", type=float, default=0.55, help="scatter opacity")
     p.add_argument("--elev", type=float, default=22.0, help="initial elevation (deg)")
@@ -333,12 +339,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--segments-csv", type=str, default=None,
                    help="write the per-segment breakdown here")
     p.add_argument("--save", type=str, default=None, help="write the figure here instead of showing")
-    p.add_argument("--dpi", type=int, default=140, help="resolution for --save")
+    p.add_argument("--dpi", type=_positive_int, default=140, help="resolution for --save")
     return p
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
 
     if args.save is not None:
         import matplotlib
@@ -346,21 +353,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         matplotlib.use("Agg")  # must precede the pyplot import
     import matplotlib.pyplot as plt
 
-    sol = solve(
-        Config(
-            h=args.height,
-            y_end=args.end_altitude,
-            g=args.gravity,
-            v0=args.v0,
-            x_step=args.x_step,
-            y_step=args.y_step,
-            x_max=args.x_max,
-            theta_ratio=args.theta_ratio,
-            depth_below=args.depth_below,
-            neighbourhood_cells=args.neighbourhood,
-            max_turn_deg=args.max_turn,
+    try:
+        sol = solve(
+            Config(
+                h=args.height,
+                y_end=args.end_altitude,
+                g=args.gravity,
+                v0=args.v0,
+                x_step=args.x_step,
+                y_step=args.y_step,
+                x_max=args.x_max,
+                theta_ratio=args.theta_ratio,
+                depth_below=args.depth_below,
+                neighbourhood_cells=args.neighbourhood,
+                max_turn_deg=args.max_turn,
+            )
         )
-    )
+    except (ValueError, TypeError) as exc:
+        # Cross-field problems (h below y_end, theta_ratio with x_max) can only
+        # be caught once the values are combined, so report them the same way
+        # argparse reports a bad single value: usage line, message, exit 2.
+        parser.error(str(exc))
     if args.segments_csv is not None:
         import csv
 
@@ -392,7 +405,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         fig.savefig(args.save, dpi=args.dpi, bbox_inches="tight")
         print(f"wrote {args.save}")
     else:
-        plt.show()
+        try:
+            plt.show()
+        except KeyboardInterrupt:
+            # plt.show() blocks in the backend's native run loop.  matplotlib
+            # installs a SIGINT handler so Ctrl-C can break out of it, then
+            # re-raises on the way past -- which is a deliberate exit route, not
+            # a failure, so it should not print a traceback.
+            return 130  # conventional exit status for SIGINT
     return 0
 
 
