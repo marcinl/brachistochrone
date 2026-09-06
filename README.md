@@ -387,6 +387,103 @@ target altitude — marked by the dashed rectangle.
 
 ---
 
+## Variable gravity, g = g(x)
+
+```bash
+python brachistochrone.py --gravity-func "poly:9.81,0.05"
+python plot_states.py --gravity-json gravity.json --curve
+```
+
+![Descent under different gravity fields](docs/images/gravity-fields.png)
+
+The curves respond the way physics demands. Where `g` **rises** with x the path
+stays high longer, saving its drop for where gravity pays best; where `g`
+**falls** it dives early to bank energy while gravity is still strong.
+
+### This breaks the conservation shortcut
+
+Everything above rests on speed being a function of altitude alone. That holds
+only because uniform gravity is a **conservative** field. Let `g` depend on `x`
+and the field `F = (0, −g(x))` acquires a non-zero curl:
+
+```
+dF_y/dx − dF_x/dy = −dg/dx
+```
+
+A non-conservative field has no potential, so the work between two points
+depends on the route. Under `g(x) = 1 + x`, three paths from `(0,10)` to
+`(10,0)` arrive at **4.47, 10.95 and 14.83 m/s** — same endpoints, 3.3× spread.
+
+So arrival speed becomes part of the **state**, not a function of it, and plain
+Dijkstra is no longer valid: settling a cell once would discard a slower arrival
+carrying *more* energy, which may still win downstream.
+
+### The energy-augmented search
+
+For a variable field the solver switches to **label-setting Dijkstra**. Each
+cell holds a set of `(time, energy)` labels rather than one value. Labels pop in
+time order, so an incoming label is worth keeping only if its energy beats every
+label already settled at that cell — otherwise an earlier label was both faster
+*and* richer and dominates it outright. That is exact Pareto domination; with
+`energy_tol = 0` nothing that could matter is discarded.
+
+Work along a chord still has a closed form, because `dy/dx` is constant on a
+straight segment and factors out of the integral:
+
+```
+dKE = (drop / run) · ∫ g(x) dx        (run > 0)
+dKE = g(x) · drop                     (run = 0, vertical)
+```
+
+**Uniform gravity keeps the original fast path**, untouched — the label search
+only engages when the field actually varies. That is verified rather than
+assumed: running the label search on a field that happens to be *constant*
+reproduces the plain solver to **8.9e-16 s** with byte-identical paths.
+
+Cost: the default 100 m problem builds ~1.3M labels in a few seconds versus 6720
+states instantly. `--energy-tol` merges near-equal energies to bound that; on the
+test field, tolerances from 1e-4 to 1e-1 cut labels 42% with *no* change to the
+answer at all.
+
+### Specifying the field
+
+Analytic families, one shell-safe token each:
+
+| spec | field |
+|---|---|
+| `const:9.81` | `g = 9.81` |
+| `poly:9.81,0.02,-1e-4` | `g = 9.81 + 0.02x − 1e-4x²` (ascending powers) |
+| `power:0.5,2,9.81` | `g = 9.81 + 0.5x²` |
+| `sin:2,0.05,0,9.81` | `g = 9.81 + 2·sin(0.05x)` |
+| `cos:2,0.05,0,9.81` | `g = 9.81 + 2·cos(0.05x)` |
+| `exp:5,2,1e-3,9.81` | `g = 9.81 + 5·exp(−1e-3·x²)` |
+
+`poly` takes coefficients **constant-first**, so the offset that keeps `g`
+positive always leads. Trailing parameters may be omitted. Gravity must be
+positive everywhere on the grid — a sinusoid without an offset is rejected with
+a message saying so, rather than producing nonsense.
+
+Or a JSON table, one value per grid column:
+
+```bash
+python make_gravity_json.py --x-max 157.08 --x-step 5 --func "poly:9.81,0.05" -o g.json
+python brachistochrone.py --gravity-json g.json
+```
+
+The generator computes the required count for you. A table of the wrong length
+is refused with both counts and the exact command that would regenerate it.
+
+### Caveats
+
+- **The analytic cycloid is not a valid reference** under variable gravity, so
+  the summary drops that column and reports the search result alone.
+- **`x_max` still defaults to `π·drop/2`**, which is derived for uniform
+  gravity. It remains a reasonable envelope but is no longer provably tight;
+  set `--x-max` or `--theta-ratio` explicitly if the field is extreme.
+- **`Solution.speed` is NaN** for a variable field — a per-altitude speed column
+  is meaningless when speed is path-dependent. Use `arrival_speed`, or
+  `path_segments`, which accumulates along the actual chords.
+
 ## Accuracy
 
 Validated against the closed-form cycloid at every endpoint:

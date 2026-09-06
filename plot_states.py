@@ -325,6 +325,14 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="endpoint as theta/pi of the cycloid; >1 dips below the target")
     p.add_argument("--depth-below", type=_non_negative_float, default=None,
                    help="grid headroom below the target altitude (m); enables climbing")
+    p.add_argument("--gravity-func", type=str, default=None, metavar="SPEC",
+                   help='variable gravity g(x), e.g. "poly:9.81,0.02" or '
+                        '"sin:2,0.05,0,9.81"; see gravity.py for families')
+    p.add_argument("--gravity-json", type=str, default=None, metavar="PATH",
+                   help="variable gravity from a JSON table (see make_gravity_json.py)")
+    p.add_argument("--energy-tol", type=_non_negative_float, default=0.0,
+                   help="merge search labels whose energies differ by less than this "
+                        "(0 = exact, raise it if the label guard trips)")
     p.add_argument("--neighbourhood", type=_positive_int, default=5, help="chord span in cells")
     p.add_argument("--max-turn", type=float, default=None, help="heading change limit (deg)")
     p.add_argument("--target", type=float, default=None, help="endpoint for the overlaid path (m)")
@@ -365,14 +373,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 x_max=args.x_max,
                 theta_ratio=args.theta_ratio,
                 depth_below=args.depth_below,
-                neighbourhood_cells=args.neighbourhood,
+                gravity_spec=args.gravity_func,
+            gravity_json=args.gravity_json,
+            energy_tol=args.energy_tol,
+            neighbourhood_cells=args.neighbourhood,
                 max_turn_deg=args.max_turn,
             )
         )
-    except (ValueError, TypeError) as exc:
-        # Cross-field problems (h below y_end, theta_ratio with x_max) can only
-        # be caught once the values are combined, so report them the same way
-        # argparse reports a bad single value: usage line, message, exit 2.
+    except (ValueError, TypeError, OSError) as exc:
+        # Cross-field problems (h below y_end, theta_ratio with x_max) and bad
+        # gravity input (unreadable JSON, non-positive field) can only be caught
+        # once the values are combined, so report them the same way argparse
+        # reports a bad single value: usage line, message, exit 2.
         parser.error(str(exc))
     if args.segments_csv is not None:
         import csv

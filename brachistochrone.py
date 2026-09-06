@@ -44,6 +44,14 @@ from typing import Iterator, Sequence
 
 import numpy as np
 
+from gravity import (
+    GravityField,
+    check_positive,
+    field_from_spec,
+    load_json,
+    uniform_field,
+)
+
 __all__ = [
     "Config",
     "Solution",
@@ -265,6 +273,9 @@ class Config:
     neighbourhood_cells: int = 5
     max_turn_deg: float | None = None
     launch_angles_deg: Sequence[float] | None = None
+    gravity_spec: str | None = None
+    gravity_json: str | None = None
+    energy_tol: float = 0.0
 
     def __post_init__(self) -> None:
         if self.h <= self.y_end:
@@ -287,6 +298,14 @@ class Config:
             raise ValueError("depth_below must be non-negative")
         if self.theta_ratio is not None and self.x_max is not None:
             raise TypeError("give either theta_ratio or x_max, not both")
+        if self.gravity_spec is not None and self.gravity_json is not None:
+            raise TypeError("give either gravity_spec or gravity_json, not both")
+        if self.energy_tol < 0:
+            raise ValueError("energy_tol must be non-negative")
+
+    @property
+    def has_variable_gravity(self) -> bool:
+        return self.gravity_spec is not None or self.gravity_json is not None
 
     @property
     def drop(self) -> float:
@@ -341,6 +360,12 @@ class Solution:
     x_max: float
     x_max_binding: str
     iy_target: int  # row holding y_end; rows past it are dip headroom
+    field: GravityField | None = None
+    # Set only for a variable field, where arrival speed is part of the search
+    # state rather than a function of altitude.
+    arrival_speed: np.ndarray | None = None  # (nx, ny, nr)
+    label_of: np.ndarray | None = None  # (nx, ny, nr) -> index into label_link
+    label_link: np.ndarray | None = None  # (n_labels, 4): parent, ix, iy, ir
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -367,7 +392,22 @@ class Solution:
             _, ir = self.best_at(ix, iy)
         if not math.isfinite(self.time[ix, iy, ir]):
             raise ValueError(f"state ({ix}, {iy}, {ir}) is unreachable")
-        states: list[tuple[int, int, int]] = []
+
+        if self.label_of is not None:
+            # Variable gravity: several labels may share a cell at different
+            # energies, so the chain has to follow label parents.  Walking
+            # ``prev`` would be free to hop between labels and produce a route
+            # that was never actually searched.
+            states = []
+            k = int(self.label_of[ix, iy, ir])
+            while k >= 0:
+                parent, j, i, r = (int(v) for v in self.label_link[k])
+                states.append((j, i, r))
+                k = parent
+            states.reverse()
+            return states
+
+        states = []
         j, i, r = ix, iy, ir
         while j >= 0:
             states.append((j, i, r))
@@ -407,13 +447,13 @@ class Solution:
             ]
         )
         out = np.empty(len(nodes) - 1, dtype=dtype)
+        speeds = self.speeds_along(nodes)
         t_cursor = 0.0
         s_cursor = 0.0
         for k, ((x1, y1), (x2, y2)) in enumerate(zip(nodes, nodes[1:])):
             dx, dy = x2 - x1, y2 - y1
             length = math.hypot(dx, dy)
-            v1 = self._speed_at_altitude(y1)
-            v2 = self._speed_at_altitude(y2)
+            v1, v2 = speeds[k], speeds[k + 1]
             if v1 + v2 <= 0.0:
                 raise ValueError("segment is untraversable from rest")
             dt_seg = 2.0 * length / (v1 + v2)
@@ -445,11 +485,11 @@ class Solution:
             raise ValueError("need at least two nodes to sample")
 
         segments = []  # (t_start, v1, accel, length, p1, p2)
+        speeds = self.speeds_along(nodes)
         t_cursor = 0.0
-        for (x1, y1), (x2, y2) in zip(nodes, nodes[1:]):
+        for k, ((x1, y1), (x2, y2)) in enumerate(zip(nodes, nodes[1:])):
             length = math.hypot(x2 - x1, y1 - y2)
-            v1 = self._speed_at_altitude(y1)
-            v2 = self._speed_at_altitude(y2)
+            v1, v2 = speeds[k], speeds[k + 1]
             if v1 + v2 <= 0.0:
                 raise ValueError("segment is untraversable from rest")
             duration = 2.0 * length / (v1 + v2)
@@ -513,7 +553,8 @@ class Solution:
         arr["r_deg"] = self.r_deg[None, None, :]
         arr["t_min"] = self.time
         arr["path_len"] = self.length
-        arr["v"] = self.speed[None, :, None]
+        arr["v"] = (self.speed[None, :, None] if self.arrival_speed is None
+                    else self.arrival_speed)
         arr["reachable"] = np.isfinite(self.time)
 
         pj, pi = self.prev[..., 0], self.prev[..., 1]
@@ -522,13 +563,36 @@ class Solution:
         py = np.where(has_prev, self.y[np.clip(pi, 0, None)], np.nan)
         arr["dx"] = np.where(has_prev, arr["x"] - px, np.nan)
         arr["dy"] = np.where(has_prev, arr["y"] - py, np.nan)
-        arr["v_in"] = np.where(has_prev, self.speed[np.clip(pi, 0, None)], np.nan)
+        if self.arrival_speed is None:
+            arr["v_in"] = np.where(has_prev, self.speed[np.clip(pi, 0, None)], np.nan)
+        else:
+            pr = self.prev[..., 2]
+            src = self.arrival_speed[np.clip(pj, 0, None), np.clip(pi, 0, None),
+                                     np.clip(pr, 0, None)]
+            arr["v_in"] = np.where(has_prev, src, np.nan)
         arr["angle_in_deg"] = np.degrees(np.arctan2(-arr["dy"], arr["dx"]))
         return arr
 
     def _speed_at_altitude(self, y: float) -> float:
         cfg = self.config
         return math.sqrt(cfg.v0 * cfg.v0 + 2.0 * cfg.g * (cfg.h - y))
+
+    def speeds_along(self, nodes: Sequence[tuple[float, float]]) -> list[float]:
+        """Speed at each node of a polyline.
+
+        Under uniform gravity altitude alone fixes the speed.  Under a variable
+        field the force is non-conservative -- there is no potential -- so the
+        speed has to be accumulated chord by chord from the start, and two
+        routes to the same point genuinely differ.
+        """
+        if self.field is None or self.field.uniform:
+            return [self._speed_at_altitude(y) for _, y in nodes]
+        energy = 0.5 * self.config.v0 * self.config.v0
+        speeds = [math.sqrt(2.0 * energy)]
+        for (x1, y1), (x2, y2) in zip(nodes, nodes[1:]):
+            energy += self.field.chord_work(x1, y1, x2, y2)
+            speeds.append(math.sqrt(2.0 * max(energy, 0.0)))
+        return speeds
 
 
 # --------------------------------------------------------------------------
@@ -613,19 +677,70 @@ def solve(config: Config | None = None, **overrides) -> Solution:
             (dj, di, length, _bin_index(angle, cfg.angle_step_deg, nr, cfg.angle_min_deg))
         )
 
+    field = _build_field(cfg, x, x_max)
+    if not field.uniform:
+        check_positive(field)
+        # Speed is no longer a function of altitude, so the per-row column is
+        # meaningless; the searched arrival speeds go on the Solution instead.
+        speed = np.full(ny, np.nan)
+
+    seeds = _seed_bins(cfg, nr)
     shape = (nx, ny, nr)
+    if field.uniform:
+        found = _search_uniform(cfg, shape, speed, moves, r_deg, seeds)
+    else:
+        found = _search_variable(cfg, shape, x, y, x_step, y_step, field,
+                                 moves, r_deg, seeds)
+    time, length, prev, arrival_speed, label_of, label_link = found
+
+    return Solution(
+        config=cfg,
+        x=x,
+        y=y,
+        r_deg=r_deg,
+        speed=speed,
+        time=time,
+        length=length,
+        prev=prev,
+        x_max=x_max,
+        x_max_binding=binding,
+        iy_target=iy_target,
+        field=field,
+        arrival_speed=arrival_speed,
+        label_of=label_of,
+        label_link=label_link,
+    )
+
+
+def _build_field(cfg: Config, x: np.ndarray, x_max: float) -> GravityField:
+    """Resolve the configured gravity onto the solver's own x grid.
+
+    Sampling analytic specs and JSON tables onto the same grid means both are
+    integrated identically, so results from the two routes are comparable.
+    """
+    if cfg.gravity_json is not None:
+        return load_json(cfg.gravity_json, x)
+    if cfg.gravity_spec is not None:
+        return field_from_spec(cfg.gravity_spec, x)
+    return uniform_field(cfg.g, x_max)
+
+
+def _seed_bins(cfg: Config, nr: int):
+    if cfg.launch_angles_deg is None:
+        return list(range(nr))
+    return sorted({
+        _bin_index(a, cfg.angle_step_deg, nr, cfg.angle_min_deg)
+        for a in cfg.launch_angles_deg
+    })
+
+
+def _search_uniform(cfg, shape, speed, moves, r_deg, seeds):
+    """Plain Dijkstra: speed follows from altitude, so a cell settles once."""
+    nx, ny, nr = shape
     time = np.full(shape, np.inf)
     length = np.full(shape, np.inf)
     prev = np.full(shape + (3,), -1, dtype=np.int32)
     settled = np.zeros(shape, dtype=bool)
-
-    if cfg.launch_angles_deg is None:
-        seeds = range(nr)
-    else:
-        seeds = {
-            _bin_index(a, cfg.angle_step_deg, nr, cfg.angle_min_deg)
-            for a in cfg.launch_angles_deg
-        }
 
     heap: list[tuple[float, int, int, int]] = []
     for ir in seeds:
@@ -662,19 +777,130 @@ def solve(config: Config | None = None, **overrides) -> Solution:
                 prev[nj, ni, ir_next] = (j, i, ir)
                 heapq.heappush(heap, (t_next, nj, ni, ir_next))
 
-    return Solution(
-        config=cfg,
-        x=x,
-        y=y,
-        r_deg=r_deg,
-        speed=speed,
-        time=time,
-        length=length,
-        prev=prev,
-        x_max=x_max,
-        x_max_binding=binding,
-        iy_target=iy_target,
-    )
+    return time, length, prev, None, None, None
+
+
+#: Guard against label explosion in the variable-gravity search.
+MAX_LABELS = 3_000_000
+
+
+def _search_variable(cfg, shape, x, y, x_step, y_step, field, moves, r_deg, seeds):
+    """Label-setting Dijkstra with kinetic energy carried in the state.
+
+    Why this is needed
+    ------------------
+    A field that varies with x is non-conservative, so arrival speed depends on
+    the route taken, not just the cell reached.  Plain Dijkstra settles a cell
+    once and discards every later path to it -- which here would throw away a
+    slower arrival that carries *more* energy and therefore wins further on.
+
+    So a cell holds a set of ``(time, energy)`` labels instead of one value.
+    Labels are popped in time order, so an incoming label is worth keeping only
+    if its energy beats every label already settled at that cell; otherwise some
+    earlier label was both faster and richer, and dominates it outright.  That
+    is exact Pareto domination -- with ``energy_tol = 0`` nothing is discarded
+    that could have mattered.
+
+    ``energy_tol`` above zero merges labels whose energies differ by less than
+    the tolerance.  That bounds the label count on pathological fields at the
+    cost of a controlled approximation.
+    """
+    nx, ny, nr = shape
+    time = np.full(shape, np.inf)
+    length = np.full(shape, np.inf)
+    prev = np.full(shape + (3,), -1, dtype=np.int32)
+    arrival_speed = np.full(shape, np.nan)
+    label_of = np.full(shape, -1, dtype=np.int64)
+
+    # Plain Python lists: the inner loop is scalar work, and numpy indexing per
+    # element would cost more than it saves.
+    gvals = [float(v) for v in field.g]
+    cum = [float(v) for v in field.cum]
+    best_e = [[-math.inf] * ny for _ in range(nx)]
+
+    # Per-move geometry is constant; only the integral term depends on column.
+    prepared = []
+    for dj, di, seg_len, ir_next in moves:
+        run = dj * x_step
+        # y decreases with row index, so di > 0 descends and loses height
+        # di*y_step -- a positive drop, which is what gains energy.
+        drop = di * y_step
+        prepared.append((dj, di, seg_len, ir_next, run, drop,
+                         (drop / run) if run else 0.0))
+
+    link_parent: list[int] = []
+    link_cell: list[tuple[int, int, int]] = []
+    energy0 = 0.5 * cfg.v0 * cfg.v0
+    tol = cfg.energy_tol
+
+    heap: list[tuple[float, float, float, int]] = []
+    for ir in seeds:
+        link_parent.append(-1)
+        link_cell.append((0, 0, ir))
+        k = len(link_parent) - 1
+        time[0, 0, ir] = 0.0
+        length[0, 0, ir] = 0.0
+        arrival_speed[0, 0, ir] = math.sqrt(2.0 * energy0)
+        label_of[0, 0, ir] = k
+        heapq.heappush(heap, (0.0, 0.0, -energy0, k))
+
+    while heap:
+        t, s_len, neg_e, k = heapq.heappop(heap)
+        e = -neg_e
+        j, i, ir = link_cell[k]
+
+        # Record the arrival even if the label is about to be dominated: it is
+        # a real path, and keeping it populates the heading axis for output.
+        if t < time[j, i, ir]:
+            time[j, i, ir] = t
+            length[j, i, ir] = s_len
+            arrival_speed[j, i, ir] = math.sqrt(2.0 * e)
+            label_of[j, i, ir] = k
+            parent = link_parent[k]
+            prev[j, i, ir] = link_cell[parent] if parent >= 0 else (-1, -1, -1)
+
+        if e <= best_e[j][i] + tol:
+            continue  # an earlier label reached here no slower and no poorer
+        best_e[j][i] = e
+
+        v = math.sqrt(2.0 * e)
+        heading = r_deg[ir]
+        for dj, di, seg_len, ir_next, run, drop, ratio in prepared:
+            nj, ni = j + dj, i + di
+            if nj >= nx or ni >= ny or ni < 0:
+                continue
+            if cfg.max_turn_deg is not None:
+                if abs(r_deg[ir_next] - heading) > cfg.max_turn_deg + 1e-9:
+                    continue
+            # Work per unit mass over the chord.  dy/dx is constant along it, so
+            # it factors out of the integral of g dx.
+            work = gvals[j] * drop if run == 0.0 else ratio * (cum[nj] - cum[j])
+            e_next = e + work
+            if e_next <= 0.0:
+                continue  # would arrive stalled or with imaginary speed
+            if e_next <= best_e[nj][ni] + tol:
+                continue  # already reached faster and with at least as much energy
+            v_next = math.sqrt(2.0 * e_next)
+            v_sum = v + v_next
+            if v_sum <= 0.0:
+                continue
+            if len(link_parent) >= MAX_LABELS:
+                raise RuntimeError(
+                    f"variable-gravity search exceeded {MAX_LABELS} labels; "
+                    "raise Config.energy_tol to merge near-equal energies"
+                )
+            link_parent.append(k)
+            link_cell.append((nj, ni, ir_next))
+            heapq.heappush(
+                heap,
+                (t + 2.0 * seg_len / v_sum, s_len + seg_len, -e_next,
+                 len(link_parent) - 1),
+            )
+
+    link = np.empty((len(link_parent), 4), dtype=np.int64)
+    link[:, 0] = link_parent
+    link[:, 1:] = link_cell
+    return time, length, prev, arrival_speed, label_of, link
 
 
 # --------------------------------------------------------------------------
@@ -729,6 +955,14 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="endpoint as theta/pi of the cycloid; >1 dips below the target")
     p.add_argument("--depth-below", type=_non_negative_float, default=None,
                    help="grid headroom below the target altitude (m); enables climbing")
+    p.add_argument("--gravity-func", type=str, default=None, metavar="SPEC",
+                   help='variable gravity g(x), e.g. "poly:9.81,0.02" or '
+                        '"sin:2,0.05,0,9.81"; see gravity.py for families')
+    p.add_argument("--gravity-json", type=str, default=None, metavar="PATH",
+                   help="variable gravity from a JSON table (see make_gravity_json.py)")
+    p.add_argument("--energy-tol", type=_non_negative_float, default=0.0,
+                   help="merge search labels whose energies differ by less than this "
+                        "(0 = exact, raise it if the label guard trips)")
     p.add_argument("--angle-step", type=_positive_float, default=10.0, help="heading bin width (deg)")
     p.add_argument("--neighbourhood", type=_positive_int, default=5, help="chord span in cells")
     p.add_argument("--max-turn", type=float, default=None, help="heading change limit (deg)")
@@ -752,20 +986,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             x_max=args.x_max,
             theta_ratio=args.theta_ratio,
             depth_below=args.depth_below,
-            angle_step_deg=args.angle_step,
+            gravity_spec=args.gravity_func,
+        gravity_json=args.gravity_json,
+        energy_tol=args.energy_tol,
+        angle_step_deg=args.angle_step,
             neighbourhood_cells=args.neighbourhood,
             max_turn_deg=args.max_turn,
         )
         sol = solve(cfg)
-    except (ValueError, TypeError) as exc:
-        # Cross-field problems (h below y_end, theta_ratio with x_max) can only
-        # be caught once the values are combined, so report them the same way
-        # argparse reports a bad single value: usage line, message, exit 2.
+    except (ValueError, TypeError, OSError) as exc:
+        # Cross-field problems (h below y_end, theta_ratio with x_max) and bad
+        # gravity input (unreadable JSON, non-positive field) can only be caught
+        # once the values are combined, so report them the same way argparse
+        # reports a bad single value: usage line, message, exit 2.
         parser.error(str(exc))
     nx, ny, nr = sol.shape
     iyt = sol.iy_target
 
     print(f"drop {cfg.drop:g} m, g {cfg.g:g} m/s^2, v0 {cfg.v0:g} m/s")
+    print(f"gravity field       {sol.field.describe()}")
     print(f"free-fall time      {free_fall_time(cfg.drop, cfg.g, cfg.v0):.4f} s")
     print(f"time budget         {cfg.default_time_budget:g} s")
     print(f"horizontal extent   {sol.x_max:.3f} m  (limited by {sol.x_max_binding})")
@@ -775,19 +1014,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     print()
 
     targets = [args.target] if args.target is not None else [0.0, 25.0, 50.0, 100.0, sol.x_max]
-    print(f"{'x_end (m)':>10} {'discrete (s)':>13} {'analytic (s)':>13} {'error':>8} {'len (m)':>9}")
+    # The analytic cycloid assumes uniform gravity, so it is not a valid
+    # reference once the field varies -- report the search result alone.
+    comparable = sol.field.uniform
+    if comparable:
+        print(f"{'x_end (m)':>10} {'discrete (s)':>13} {'analytic (s)':>13} "
+              f"{'error':>8} {'len (m)':>9}")
+    else:
+        print(f"{'x_end (m)':>10} {'time (s)':>13} {'len (m)':>9} {'v_end (m/s)':>12}")
     for xt in targets:
         ix = sol.target_index(xt)
         t_num, ir = sol.best_at(ix, iyt)
         if not math.isfinite(t_num):
             print(f"{sol.x[ix]:10.2f} {'unreachable':>13}")
             continue
-        t_ref, _ = analytic_brachistochrone(float(sol.x[ix]), cfg.drop, cfg.g)
-        err = (t_num - t_ref) / t_ref
-        print(
-            f"{sol.x[ix]:10.2f} {t_num:13.4f} {t_ref:13.4f} "
-            f"{err:7.2%} {sol.length[ix, iyt, ir]:9.2f}"
-        )
+        if comparable:
+            t_ref, _ = analytic_brachistochrone(float(sol.x[ix]), cfg.drop, cfg.g)
+            err = (t_num - t_ref) / t_ref
+            print(
+                f"{sol.x[ix]:10.2f} {t_num:13.4f} {t_ref:13.4f} "
+                f"{err:7.2%} {sol.length[ix, iyt, ir]:9.2f}"
+            )
+        else:
+            v_end = sol.arrival_speed[ix, iyt, ir]
+            print(f"{sol.x[ix]:10.2f} {t_num:13.4f} "
+                  f"{sol.length[ix, iyt, ir]:9.2f} {v_end:12.2f}")
 
     if args.csv is not None:
         ix = sol.target_index(args.target if args.target is not None else sol.x_max)
