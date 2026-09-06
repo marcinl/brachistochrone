@@ -271,10 +271,14 @@ def plot_curve(sol, target_x: float | None = None, show_samples: bool = True):
     )
 
     # --- continuous reference ------------------------------------------------
-    cx, cdrop = cycloid_curve(x_end, cfg.drop)
-    t_ref, arc_ref = analytic_brachistochrone(x_end, cfg.drop, cfg.g)
-    ax.plot(cx, cfg.h - cdrop, color="0.35", linewidth=1.6, linestyle="--",
-            zorder=2, label=f"continuous cycloid  ({t_ref:.4f} s)")
+    # The cycloid is the optimum only for uniform gravity; drawing it against a
+    # variable field would assert a comparison that does not hold.
+    uniform_field = sol.field is None or sol.field.uniform
+    if uniform_field:
+        cx, cdrop = cycloid_curve(x_end, cfg.drop)
+        t_ref, arc_ref = analytic_brachistochrone(x_end, cfg.drop, cfg.g)
+        ax.plot(cx, cfg.h - cdrop, color="0.35", linewidth=1.6, linestyle="--",
+                zorder=2, label=f"continuous cycloid  ({t_ref:.4f} s)")
     ax.plot([0.0, x_end], [cfg.h, cfg.y_end], color="0.6", linewidth=1.2,
             linestyle=":", zorder=1, label="straight chord (slower)")
 
@@ -289,11 +293,17 @@ def plot_curve(sol, target_x: float | None = None, show_samples: bool = True):
     ax.set_ylabel("altitude (m)")
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, color="0.9")
+    if uniform_field:
+        subtitle = (f"discrete {t_total:.4f} s over {seg['length'].sum():.2f} m   |   "
+                    f"cycloid {t_ref:.4f} s over {arc_ref:.2f} m   |   "
+                    f"gap {(t_total - t_ref) / t_ref:+.2%}")
+    else:
+        subtitle = (f"{sol.field.describe()}\n"
+                    f"discrete {t_total:.4f} s over {seg['length'].sum():.2f} m, "
+                    f"v_end {seg['v2'][-1]:.2f} m/s")
     ax.set_title(
         f"Minimum-time descent  (0, {cfg.h:g})  ->  ({x_end:.2f}, {cfg.y_end:g})\n"
-        f"discrete {t_total:.4f} s over {seg['length'].sum():.2f} m   |   "
-        f"cycloid {t_ref:.4f} s over {arc_ref:.2f} m   |   "
-        f"gap {(t_total - t_ref) / t_ref:+.2%}",
+        + subtitle,
         fontsize=11,
     )
     ax.legend(loc="lower left", fontsize=9, framealpha=0.9)
@@ -302,8 +312,9 @@ def plot_curve(sol, target_x: float | None = None, show_samples: bool = True):
     t_nodes = np.concatenate([seg["t_start"], [seg["t_end"][-1]]])
     v_nodes = np.concatenate([seg["v1"], [seg["v2"][-1]]])
     ax2.plot(t_nodes, v_nodes, color="#1f77b4", linewidth=2.0, label="speed at chord joints")
-    ax2.axhline(math.sqrt(cfg.v0**2 + 2 * cfg.g * cfg.drop), color="0.5",
-                linestyle="--", linewidth=1.2, label="sqrt(v0² + 2g·drop)")
+    if uniform_field:
+        ax2.axhline(math.sqrt(cfg.v0**2 + 2 * cfg.g * cfg.drop), color="0.5",
+                    linestyle="--", linewidth=1.2, label="sqrt(v0² + 2g·drop)")
     ax2.set_xlabel("t (s)")
     ax2.set_ylabel("speed (m/s)")
     ax2.grid(True, color="0.9")
